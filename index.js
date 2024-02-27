@@ -1,41 +1,27 @@
 'use strict'
-const autopilot  = require('./myn2kpilot')
-
-/*****************************************************************
- * autopilot type identifier - set a value that is unique.
- * The value must be valid for use in URI path  as it is used 
- * to target commands to a specific device.
- * 
- * e.g.  * apType= 'mypilot'
- * 
- * POST "./steering/autopilot/mypilotid/engage"
- * ***************************************************************/
-const apType = 'myN2kPilot'  
+const apModule = require('./myn2kpilot')
 
 module.exports = function(app) {
 
+  let autopilot = apModule(app)
+  
   let plugin = {
     id: "sk-autopilot-provider",
-    name: "Autopilot Control",
-    description: "Plugin that controls an autopilot"
+    name: "Autopilot Template Provider",
+    description: "V2 Plugin that controls an autopilot."
   }
 
-  plugin.start = function(props) {
+  plugin.start = (props) => {
     autopilot.start(props)
     registerProvider()
   }
 
-  plugin.stop = function() {
+  plugin.stop = () => {
     autopilot.stop()
   }
 
-  plugin.schema = function() {
-    return {
-      title: "Autopilot Control",
-      type: "object",
-      properties: autopilot.properties()
-    }
-  }
+  plugin.schema = autopilot.properties
+
 
   // Autopilot API - register with Autopilot API
   const registerProvider = ()=> {
@@ -101,7 +87,7 @@ module.exports = function(app) {
             throw new Error('Not implemented!')
           }
         },
-        [apType]
+        [autopilot.type]
       )
     } catch (error) {
       app.debug(error)

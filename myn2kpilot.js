@@ -10,7 +10,16 @@
   *************************************************************
 */
 
-
+/*****************************************************************
+ * autopilot type identifier - set a value that is unique.
+ * The value must be valid for use in URI path  as it is used 
+ * to target commands to a specific device.
+ * 
+ * e.g.  * apType= 'mypilot'
+ * 
+ * POST "./steering/autopilot/mypilotid/engage"
+ * ***************************************************************/
+const apType = 'myN2kPilot'
 
 /***********************************************************
  * Define the text used to discover the autopilot device.
@@ -98,7 +107,9 @@ const apStatus = {          // device status
 }
 
 module.exports = function(app) {
-  
+
+  let pilot = {id: null, type: apType }
+
   pilot.start = (props) => {
     deviceId = props.deviceId
     app.debug('props.deviceId =', props.deviceId)
@@ -198,7 +209,7 @@ module.exports = function(app) {
   ******************************/
   pilot.properties = () => {
     let discId = deviceId ?? autopilot_dst
-    let description = 'No device found!'
+    let description = ''
 
     app.debug('***pre-discovery -> discId', discId)
 
@@ -208,7 +219,8 @@ module.exports = function(app) {
         _.values(sources).forEach(v => {
           if ( typeof v === 'object' ) {
             _.keys(v).forEach(id => {
-              if ( v[id] && v[id].n2k && v[id].n2k.hardwareVersion && v[id].n2k.hardwareVersion.startsWith(apDeviceSearchText) ) {
+              if ( v[id] && v[id].n2k && v[id].n2k.hardwareVersion && v[id].n2k.hardwareVersion
+                .startsWith(apDeviceSearchText) ) {
                 discId = id
                 discovered = true
               }
@@ -222,166 +234,173 @@ module.exports = function(app) {
       deviceId = discId
       description = `Discovered autopilot device with id ${discId}`
       app.debug(description)
+    } else {
+      description = `No device found! Using ID: ${discId}.`
+      app.debug(description)
     }
 
     app.debug('*** post-discovery -> deviceId', deviceId)
-      
+    
     return {
-      deviceId: {
-        type: "string",
-        title: "Autopilot NMEA2000 id.",
-        description,
-        default: deviceId
+      properties: {
+        deviceId: {
+          type: "string",
+          title: "Autopilot NMEA2000 id.",
+          description,
+          default: deviceId
+        }
       }
     }
+  }
+
+  /***********************************
+   * NMEA2000 stream event handler.
+   * Parse NMEA2000 stream input
+   * 
+   * Update to process target PGNs 
+   * in the required maanner.
+   * *********************************/
+  const onStreamEvent = (evt) => {
+    
+    if (!pgns.includes(evt.pgn) || String(evt.src) !== deviceId) {
+      return
+    }
+    
+    // 127237 `Heading / Track control (Rudder, etc.)`
+    if (evt.pgn === 127237) { 
+      //app.debug('n2k pgn=', evt.pgn, evt.fields, evt.description)
+    }
+
+    // 65288 = notifications.autopilot.<alarmName>
+    if (evt.pgn === 65288) {
+      if (evt.fields['Manufacturer Code'] !== 'Raymarine'
+        || typeof evt.fields['Alarm Group'] === 'Autopilot'
+        || typeof evt.fields['Alarm Status'] === 'undefined') {
+        return
+      }
+
+      const method = [ 'visual' ]
+
+      let state = evt.fields['Alarm Status']
+      if ( state === 'Alarm condition met and not silenced' ) {
+        method.push('sound')
+      }
+
+      if ( state === 'Alarm condition not met' ) {
+        state = 'normal'
+      } else {
+        state = 'alarm'
+      }
+
+      let alarmId = evt.fields['Alarm ID']
+
+      if ( typeof alarmId !== 'string' ) {
+        alarmId = `Unknown Alarm ${alarmId}`
+      } else if ( 
+        state === 'alarm' &&
+          apAlarms.includes(alarmId)
+        ) {
+        state = 'alert'
+      }
+
+      // normalise alarm name
+      let alarmName = normaliseAlarmId(alarmId)
+      if (!alarmName) {
+        app.debug(`*** Normalise Alarm Failed: ${alarmId}`)
+        return
+      }
+
+      const msg = {
+        message: alarmName,
+        method: method,
+        state: state
+      }
+
+      app.autopilotAlarm(apType, alarmName, msg)
+    }
+
+    // 65345 = 'steering.autopilot.target (windAngleApparent)'
+    if (evt.pgn === 65345) {
+      let angle = evt.fields['Wind Datum'] ? Number(evt.fields['Wind Datum']) : null
+      angle = ( typeof angle === 'number' && angle > Math.PI ) ? angle-(Math.PI*2) : angle
+      apStatus.target = angle
+      app.autopilotUpdate(apType, 'target', angle)
+    }
+
+    // 65360 = 'steering.autopilot.target (true/magnetic)'
+    if (evt.pgn === 65360) {
+      const targetTrue = evt.fields['Target Heading True'] ? Number(evt.fields['Target Heading True']) : null
+      const targetMagnetic = evt.fields['Target Heading Magnetic'] ? Number(evt.fields['Target Heading Magnetic']) : null
+      const target = typeof targetTrue === 'number' ? targetTrue :
+        typeof targetMagnetic === 'number' ? targetMagnetic: null
+      apStatus.target = target
+      app.autopilotUpdate(apType, 'target', target)
+    }
+    
+    // 65379 = 'steering.autopilot.state', 'steering.autopilot.engaged'
+    if (evt.pgn === 65379) {
+      const mode = evt.fields['Pilot Mode'] ? Number(evt.fields['Pilot Mode']) : null
+      const subMode = evt.fields['Sub Mode'] ? Number(evt.fields['Sub Mode']) : null
+      if ( mode !== null || subMode !== null) {
+        if ( mode === 0 && subMode === 0 ) {
+          apStatus.state = 'standby'
+          apStatus.engaged = false
+        }
+        else if ( mode == 0 && subMode == 1 ) {
+          apStatus.state = 'wind'
+          apStatus.engaged = true
+        }
+        else if ( (mode == 128 || mode == 129) && subMode == 1 ) {
+          apStatus.state = 'route'
+          apStatus.engaged = true
+        }
+        else if ( mode == 64 && subMode == 0 ) {
+          apStatus.state = 'auto'
+          apStatus.engaged = true
+        }
+        else {
+          apStatus.state = 'standby'
+          apStatus.engaged = false
+        }
+        app.autopilotUpdate(apType, 'state', apStatus.state)
+        app.autopilotUpdate(apType, 'engaged', apStatus.engaged)
+      }
+    }
+
+  }
+
+  // normalise SK alarm path 
+  const normaliseAlarmId = (id) => {
+    switch (id) {
+      case 'WP Arrival':
+        return 'waypointArrival'
+      case 'Pilot Way Point Advance':
+        return 'waypointAdvance'
+      case 'Pilot Route Complete':
+        return 'routeComplete'
+      default:
+        return ''
+    }
+  }
+
+  // Send NMEA2000 message.
+  const sendN2k = (msgs) => {
+    if (!Array.isArray(msgs)) {
+      return
+    }
+    app.debug(`sendN2k -> ${msgs}`)
+    msgs.map((msg) => { app.emit('nmea2000out', msg) })
+  }
+
+  // format N2K msg data
+  const padd = (n, p, c) => {
+    var pad_char = typeof c !== 'undefined' ? c : '0';
+    var pad = new Array(1 + p).join(pad_char);
+    return (pad + n).slice(-pad.length);
   }
 
   return pilot
 }
 
 
-/***********************************
- * NMEA2000 stream event handler.
- * Parse NMEA2000 stream input
- * 
- * Update to process target PGNs 
- * in the required maanner.
- * *********************************/
-const onStreamEvent = (evt) => {
-  
-  if (!pgns.includes(evt.pgn) || String(evt.src) !== deviceId) {
-    return
-  }
-  
-  // 127237 `Heading / Track control (Rudder, etc.)`
-  if (evt.pgn === 127237) { 
-    //app.debug('n2k pgn=', evt.pgn, evt.fields, evt.description)
-  }
 
-  // 65288 = notifications.autopilot.<alarmName>
-  if (evt.pgn === 65288) {
-    if (evt.fields['Manufacturer Code'] !== 'Raymarine'
-      || typeof evt.fields['Alarm Group'] === 'Autopilot'
-      || typeof evt.fields['Alarm Status'] === 'undefined') {
-      return
-    }
-
-    const method = [ 'visual' ]
-
-    let state = evt.fields['Alarm Status']
-    if ( state === 'Alarm condition met and not silenced' ) {
-      method.push('sound')
-    }
-
-    if ( state === 'Alarm condition not met' ) {
-      state = 'normal'
-    } else {
-      state = 'alarm'
-    }
-
-    let alarmId = evt.fields['Alarm ID']
-
-    if ( typeof alarmId !== 'string' ) {
-      alarmId = `Unknown Alarm ${alarmId}`
-    } else if ( 
-      state === 'alarm' &&
-        apAlarms.includes(alarmId)
-      ) {
-      state = 'alert'
-    }
-
-    // normalise alarm name
-    let alarmName = normaliseAlarmId(alarmId)
-    if (!alarmName) {
-      app.debug(`*** Normalise Alarm Failed: ${alarmId}`)
-      return
-    }
-
-    const msg = {
-      message: alarmName,
-      method: method,
-      state: state
-    }
-
-    app.autopilotAlarm(apType, alarmName, msg)
-  }
-
-  // 65345 = 'steering.autopilot.target (windAngleApparent)'
-  if (evt.pgn === 65345) {
-    let angle = evt.fields['Wind Datum'] ? Number(evt.fields['Wind Datum']) : null
-    angle = ( typeof angle === 'number' && angle > Math.PI ) ? angle-(Math.PI*2) : angle
-    apStatus.target = angle
-    app.autopilotUpdate(apType, 'target', angle)
-  }
-
-  // 65360 = 'steering.autopilot.target (true/magnetic)'
-  if (evt.pgn === 65360) {
-    const targetTrue = evt.fields['Target Heading True'] ? Number(evt.fields['Target Heading True']) : null
-    const targetMagnetic = evt.fields['Target Heading Magnetic'] ? Number(evt.fields['Target Heading Magnetic']) : null
-    const target = typeof targetTrue === 'number' ? targetTrue :
-      typeof targetMagnetic === 'number' ? targetMagnetic: null
-    apStatus.target = target
-    app.autopilotUpdate(apType, 'target', target)
-  }
-  
-  // 65379 = 'steering.autopilot.state', 'steering.autopilot.engaged'
-  if (evt.pgn === 65379) {
-    const mode = evt.fields['Pilot Mode'] ? Number(evt.fields['Pilot Mode']) : null
-    const subMode = evt.fields['Sub Mode'] ? Number(evt.fields['Sub Mode']) : null
-    if ( mode !== null || subMode !== null) {
-      if ( mode === 0 && subMode === 0 ) {
-        apStatus.state = 'standby'
-        apStatus.engaged = false
-      }
-      else if ( mode == 0 && subMode == 1 ) {
-        apStatus.state = 'wind'
-        apStatus.engaged = true
-      }
-      else if ( (mode == 128 || mode == 129) && subMode == 1 ) {
-        apStatus.state = 'route'
-        apStatus.engaged = true
-      }
-      else if ( mode == 64 && subMode == 0 ) {
-        apStatus.state = 'auto'
-        apStatus.engaged = true
-      }
-      else {
-        apStatus.state = 'standby'
-        apStatus.engaged = false
-      }
-      app.autopilotUpdate(apType, 'state', apStatus.state)
-      app.autopilotUpdate(apType, 'engaged', apStatus.engaged)
-    }
-  }
-
-}
-
-// normalise SK alarm path 
-const normaliseAlarmId = (id) => {
-  switch (id) {
-    case 'WP Arrival':
-      return 'waypointArrival'
-    case 'Pilot Way Point Advance':
-      return 'waypointAdvance'
-    case 'Pilot Route Complete':
-      return 'routeComplete'
-    default:
-      return ''
-  }
-}
-
-// Send NMEA2000 message.
-const sendN2k = (msgs) => {
-  if (!Array.isArray(msgs)) {
-    return
-  }
-  app.debug(`sendN2k -> ${msgs}`)
-  msgs.map((msg) => { app.emit('nmea2000out', msg) })
-}
-
-// format N2K msg data
-const padd = (n, p, c) => {
-  var pad_char = typeof c !== 'undefined' ? c : '0';
-  var pad = new Array(1 + p).join(pad_char);
-  return (pad + n).slice(-pad.length);
-}
